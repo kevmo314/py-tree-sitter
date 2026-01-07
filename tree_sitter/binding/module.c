@@ -148,7 +148,7 @@ PyMODINIT_FUNC PyInit__binding(void) {
     PyModule_AddStringConstant(module, "__version__", PY_TS_VERSION);
 
 #ifdef Py_GIL_DISABLED
-    PyUnstable_Module_SetGIL(module, Py_MOD_GIL_USED);
+    PyUnstable_Module_SetGIL(module, Py_MOD_GIL_NOT_USED);
 #endif
     return module;
 

@@ -1,5 +1,14 @@
 #include "types.h"
 
+// Critical section macros for thread safety (Python 3.13+ free-threaded builds)
+#ifdef Py_GIL_DISABLED
+#define PARSER_BEGIN_CRITICAL_SECTION(self) Py_BEGIN_CRITICAL_SECTION(self)
+#define PARSER_END_CRITICAL_SECTION() Py_END_CRITICAL_SECTION()
+#else
+#define PARSER_BEGIN_CRITICAL_SECTION(self)
+#define PARSER_END_CRITICAL_SECTION()
+#endif
+
 PyObject *point_new_internal(ModuleState *state, TSPoint point);
 
 #define SET_ATTRIBUTE_ERROR(name)                                                                  \
@@ -149,8 +158,10 @@ PyObject *parser_parse(Parser *self, PyObject *args, PyObject *kwargs) {
         // parse a buffer
         const char *source_bytes = (const char *)source_view.buf;
         uint32_t length = (uint32_t)source_view.len;
+        PARSER_BEGIN_CRITICAL_SECTION(self);
         new_tree = ts_parser_parse_string_encoding(self->parser, old_tree, source_bytes, length,
                                                    input_encoding);
+        PARSER_END_CRITICAL_SECTION();
         PyBuffer_Release(&source_view);
     } else if (PyCallable_Check(source_or_callback)) {
         // clear the GetBuffer error
@@ -169,7 +180,9 @@ PyObject *parser_parse(Parser *self, PyObject *args, PyObject *kwargs) {
             .decode = NULL,
         };
         if (progress_callback_obj == NULL) {
+            PARSER_BEGIN_CRITICAL_SECTION(self);
             new_tree = ts_parser_parse(self->parser, old_tree, input);
+            PARSER_END_CRITICAL_SECTION();
         } else if (!PyCallable_Check(progress_callback_obj)) {
             PyErr_Format(PyExc_TypeError, "progress_callback must be a callable, not %s",
                          progress_callback_obj->ob_type->tp_name);
@@ -179,7 +192,9 @@ PyObject *parser_parse(Parser *self, PyObject *args, PyObject *kwargs) {
                 .payload = progress_callback_obj,
                 .progress_callback = parser_progress_callback,
             };
+            PARSER_BEGIN_CRITICAL_SECTION(self);
             new_tree = ts_parser_parse_with_options(self->parser, old_tree, input, options);
+            PARSER_END_CRITICAL_SECTION();
         }
         if (source_view.obj) {
             PyBuffer_Release(&source_view);
@@ -213,7 +228,9 @@ PyObject *parser_parse(Parser *self, PyObject *args, PyObject *kwargs) {
 }
 
 PyObject *parser_reset(Parser *self, void *Py_UNUSED(payload)) {
+    PARSER_BEGIN_CRITICAL_SECTION(self);
     ts_parser_reset(self->parser);
+    PARSER_END_CRITICAL_SECTION();
     Py_RETURN_NONE;
 }
 
@@ -254,7 +271,9 @@ PyObject *parser_get_included_ranges(Parser *self, void *Py_UNUSED(payload)) {
 
 int parser_set_included_ranges(Parser *self, PyObject *arg, void *Py_UNUSED(payload)) {
     if (arg == NULL || arg == Py_None) {
+        PARSER_BEGIN_CRITICAL_SECTION(self);
         ts_parser_set_included_ranges(self->parser, NULL, 0);
+        PARSER_END_CRITICAL_SECTION();
         return 0;
     }
     if (!PyList_Check(arg)) {
@@ -282,7 +301,11 @@ int parser_set_included_ranges(Parser *self, PyObject *arg, void *Py_UNUSED(payl
         ranges[i] = ((Range *)range)->range;
     }
 
-    if (!ts_parser_set_included_ranges(self->parser, ranges, length)) {
+    bool success;
+    PARSER_BEGIN_CRITICAL_SECTION(self);
+    success = ts_parser_set_included_ranges(self->parser, ranges, length);
+    PARSER_END_CRITICAL_SECTION();
+    if (!success) {
         PyErr_SetString(PyExc_ValueError, "Included ranges cannot overlap");
         PyMem_Free(ranges);
         return -1;
@@ -314,6 +337,15 @@ static void log_callback(void *payload, TSLogType log_type, const char *buffer) 
 }
 
 int parser_set_logger(Parser *self, PyObject *arg, void *Py_UNUSED(payload)) {
+    // Validate argument first, outside critical section
+    if (arg != NULL && arg != Py_None && !PyCallable_Check(arg)) {
+        PyErr_Format(PyExc_TypeError, "logger must be assigned a callable object, not %s",
+                     arg->ob_type->tp_name);
+        return -1;
+    }
+
+    // All state mutation inside critical section
+    PARSER_BEGIN_CRITICAL_SECTION(self);
     free_logger(self->parser);
 
     if (arg == NULL || arg == Py_None) {
@@ -321,31 +353,31 @@ int parser_set_logger(Parser *self, PyObject *arg, void *Py_UNUSED(payload)) {
         self->logger = NULL;
         TSLogger logger = {NULL, NULL};
         ts_parser_set_logger(self->parser, logger);
-        return 0;
-    }
-    if (!PyCallable_Check(arg)) {
-        PyErr_Format(PyExc_TypeError, "logger must be assigned a callable object, not %s",
-                     arg->ob_type->tp_name);
-        return -1;
-    }
+    } else {
+        Py_XSETREF(self->logger, Py_NewRef(arg));
 
-    Py_XSETREF(self->logger, Py_NewRef(arg));
-
-    ModuleState *state = GET_MODULE_STATE(self);
-    LoggerPayload *payload = PyMem_Malloc(sizeof(LoggerPayload));
-    payload->callback = self->logger;
-    payload->log_type_type = state->log_type_type;
-    TSLogger logger = {payload, log_callback};
-    ts_parser_set_logger(self->parser, logger);
+        ModuleState *state = GET_MODULE_STATE(self);
+        LoggerPayload *log_payload = PyMem_Malloc(sizeof(LoggerPayload));
+        log_payload->callback = self->logger;
+        log_payload->log_type_type = state->log_type_type;
+        TSLogger logger = {log_payload, log_callback};
+        ts_parser_set_logger(self->parser, logger);
+    }
+    PARSER_END_CRITICAL_SECTION();
 
     return 0;
 }
 
 int parser_set_language(Parser *self, PyObject *arg, void *Py_UNUSED(payload)) {
+    // Handle clearing the language
     if (arg == NULL || arg == Py_None) {
+        PARSER_BEGIN_CRITICAL_SECTION(self);
         self->language = NULL;
+        PARSER_END_CRITICAL_SECTION();
         return 0;
     }
+
+    // Validate argument outside critical section
     if (!IS_INSTANCE(arg, language_type)) {
         PyErr_Format(PyExc_TypeError,
                      "language must be assigned a tree_sitter.Language object, not %s",
@@ -363,12 +395,20 @@ int parser_set_language(Parser *self, PyObject *arg, void *Py_UNUSED(payload)) {
         return -1;
     }
 
-    if (!ts_parser_set_language(self->parser, language->language)) {
+    // State mutation inside critical section
+    bool success;
+    PARSER_BEGIN_CRITICAL_SECTION(self);
+    success = ts_parser_set_language(self->parser, language->language);
+    if (success) {
+        Py_XSETREF(self->language, Py_NewRef(language));
+    }
+    PARSER_END_CRITICAL_SECTION();
+
+    if (!success) {
         PyErr_SetString(PyExc_RuntimeError, "Failed to set the parser language");
         return -1;
     }
 
-    Py_XSETREF(self->language, Py_NewRef(language));
     return 0;
 }
 
